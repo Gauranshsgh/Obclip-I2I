@@ -1,0 +1,30 @@
+# Core Deep Learning & Diffusion
+torch
+torchvision
+diffusers>=0.43.0
+transformers
+accelerate
+safetensors
+
+# Cloud Server API & Client
+fastapi
+uvicorn[standard]
+requests
+streamlit
+
+# Image Processing & Utilities
+pillow
+numpy
+opencv-python
+
+# Evaluation, Privacy Attack & Metrics
+scikit-learn
+matplotlib
+pandas
+lpips
+open-clip-torch
+scipy
+
+# Face Restoration (Optional Post-Processing)
+gfpgan
+basicsr
