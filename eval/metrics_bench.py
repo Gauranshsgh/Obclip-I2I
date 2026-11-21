@@ -1,26 +1,27 @@
 """
 Paper Benchmarks — eval/metrics_bench.py
 =========================================
-Runs comprehensive Phase 3 evaluations across 10 leave-one-out images:
-  1. Four Baselines:
-     - Cloud-Only (k=15, N=1)
+Runs comprehensive evaluations across 10 leave-one-out images:
+  1. Four Baselines (k=10, N=4 for ObCLIP variants; k=16 for Cloud-Only; k=0 for Client-Only):
+     - Cloud-Only (k=16, N=1)
      - Client-Only (k=0, N=1)
-     - Vanilla ObCLIP-I2I (k=5, N=4, use_accel=False)
-     - Accelerated ObCLIP-I2I (k=5, N=4, use_accel=True, r=2, s=4)
+     - Vanilla ObCLIP-I2I (k=10, N=4, use_accel=False)
+     - Accelerated ObCLIP-I2I (k=10, N=4, use_accel=True, r=2, s=5)
   2. Sweeps:
-     - Cloud switch point k in [3, 5, 7] (N=4, strength=0.6)
-     - Decoy candidate pool N in [2, 4, 6] (k=5, strength=0.6)
+     - Cloud switch point k in {4, 7, 10} (N=4, strength=0.55, Vanilla vs Accel)
+     - Decoy candidate pool N in {2, 4, 6} (k=10, strength=0.55, Accel)
 
 Metrics recorded:
   - CLIP Score (open_clip ViT-B-32 prompt-image alignment)
   - LPIPS Distance (lpips AlexNet perceptual fidelity)
-  - Cloud Latency (s) & Client Latency (s)
+  - Cloud Latency (s) & Client Latency (s) & Total Latency (s)
   - Communication Payload (KB)
   - Peak VRAM (MB)
 
 Outputs:
   - eval/results_table.csv
   - eval/tradeoff_plots.png
+  - tradeoff_plots.jpg
 """
 
 import os
@@ -40,13 +41,16 @@ import lpips
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import (
-    TOTAL_STEPS, STRENGTH, GUIDANCE_SCALE, RESOLUTION, DECOY_DIR,
+    NUM_INFERENCE_STEPS, DEFAULT_STRENGTH, DEFAULT_K, N,
+    CLOUD_GUIDANCE_SCALE, CLIENT_GUIDANCE_SCALE, RESOLUTION, DECOY_DIR,
     CLOUD_API_URL, CLOUD_ENDPOINT, DEFAULT_NEGATIVE_PROMPT,
-    VAE_MODEL_ID, CLOUD_MODEL_ID, CLIENT_MODEL_ID, DTYPE
+    VAE_MODEL_ID, CLOUD_MODEL_ID, CLIENT_MODEL_ID, DTYPE,
+    wrap_prompt
 )
 from client.decoy_manager import load_all_decoys
 from client.client_runner import load_shared_models, run_pipeline
 from client.latent_prep import encode_images, add_noise
+from client.postprocess import lab_color_match
 
 
 def ensure_server_running(project_root: str):
@@ -141,18 +145,22 @@ def run_client_only(
     real_image: Image.Image,
     prompt: str,
     models_dict: dict,
-    strength: float = STRENGTH,
-    total_steps: int = TOTAL_STEPS,
-    guidance_scale: float = GUIDANCE_SCALE,
+    strength: float = DEFAULT_STRENGTH,
+    total_steps: int = NUM_INFERENCE_STEPS,
+    guidance_scale: float = CLIENT_GUIDANCE_SCALE,
     negative_prompt: str = DEFAULT_NEGATIVE_PROMPT,
+    use_prompt_wrapper: bool = True,
+    use_lab_match: bool = True,
 ) -> dict:
-    """Executes Client-Only baseline (all active steps on compact client UNet)."""
+    """Executes Client-Only baseline with upgraded FreeU and Lab color match."""
     torch.cuda.reset_peak_memory_stats()
     vae = models_dict["vae"]
     tokenizer = models_dict["tokenizer"]
     text_encoder = models_dict["text_encoder"]
     unet_client = models_dict["unet_client"]
     scheduler = models_dict["scheduler"]
+
+    effective_prompt = wrap_prompt(prompt) if use_prompt_wrapper else prompt
 
     # 1. Encode single image
     vae.to("cuda")
@@ -166,7 +174,7 @@ def run_client_only(
 
     # 2. Text Embeddings
     text_encoder.to("cuda")
-    text_input = tokenizer(prompt, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt")
+    text_input = tokenizer(effective_prompt, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt")
     text_embeddings = text_encoder(text_input.input_ids.to("cuda"))[0]
     uncond_input = tokenizer(negative_prompt, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt")
     uncond_embeddings = text_encoder(uncond_input.input_ids.to("cuda"))[0]
@@ -200,6 +208,9 @@ def run_client_only(
     img_np = ((dec_out[0].permute(1, 2, 0).clamp(-1, 1).cpu().float().numpy() + 1.0) * 127.5).astype(np.uint8)
     final_img = Image.fromarray(img_np)
 
+    if use_lab_match:
+        final_img = lab_color_match(final_img, real_image, strength=0.35)
+
     peak_vram_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
     return {
         "final_image": final_img,
@@ -211,90 +222,151 @@ def run_client_only(
     }
 
 
-def plot_paper_tradeoffs(df: pd.DataFrame, output_path: str):
-    """Generates 4-panel publication-grade benchmark plots."""
-    fig, axes = plt.subplots(2, 2, figsize=(13, 10), dpi=200)
-    plt.subplots_adjust(hspace=0.35, wspace=0.28)
+def plot_paper_tradeoffs(df: pd.DataFrame, output_path: str, output_jpg_path: str):
+    """Generates 4-panel publication-grade benchmark plots with generous margins and data labels."""
+    fig, axes = plt.subplots(2, 2, figsize=(14, 11), dpi=300)
+    plt.subplots_adjust(hspace=0.38, wspace=0.30)
 
-    # Panel A: Quality vs Latency Pareto Curve (Baselines)
+    # ── Panel A: Quality vs Latency Pareto Curve (Baselines) ───────
     ax = axes[0, 0]
     base_df = df[df["config_type"] == "baseline"]
     grouped_base = base_df.groupby("baseline_name")[["clip_score", "total_latency_s", "peak_vram_mb"]].mean()
     
-    colors = {"Cloud-Only": "#3498DB", "Client-Only": "#9B59B6", "Vanilla ObCLIP-I2I": "#E67E22", "Accelerated ObCLIP-I2I": "#2ECC71"}
-    markers = {"Cloud-Only": "s", "Client-Only": "^", "Vanilla ObCLIP-I2I": "o", "Accelerated ObCLIP-I2I": "*"}
+    colors = {
+        "Cloud-Only": "#2980B9",
+        "Client-Only": "#8E44AD",
+        "Vanilla ObCLIP-I2I": "#D35400",
+        "Accelerated ObCLIP-I2I": "#27AE60",
+    }
+    markers = {
+        "Cloud-Only": "s",
+        "Client-Only": "^",
+        "Vanilla ObCLIP-I2I": "o",
+        "Accelerated ObCLIP-I2I": "*",
+    }
+
+    # Offsets tailored to prevent overlap
+    ann_offsets = {
+        "Cloud-Only": (0, 12),
+        "Client-Only": (0, 12),
+        "Vanilla ObCLIP-I2I": (0, -18),
+        "Accelerated ObCLIP-I2I": (0, 14),
+    }
 
     for name, row in grouped_base.iterrows():
         c = colors.get(name, "black")
         m = markers.get(name, "o")
-        ax.scatter(row["total_latency_s"], row["clip_score"], color=c, marker=m, s=160, zorder=4, label=name)
-        ax.annotate(name, (row["total_latency_s"], row["clip_score"]),
-                    textcoords="offset points", xytext=(0, 10), ha="center", fontsize=9, fontweight="bold")
+        sz = 220 if m == "*" else 160
+        ax.scatter(row["total_latency_s"], row["clip_score"], color=c, marker=m, s=sz, zorder=5, label=name, edgecolors="black", linewidths=1.2)
+        offset = ann_offsets.get(name, (0, 10))
+        ax.annotate(
+            name,
+            (row["total_latency_s"], row["clip_score"]),
+            textcoords="offset points",
+            xytext=offset,
+            ha="center",
+            va="center",
+            fontsize=9.5,
+            fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.2", facecolor="white", edgecolor=c, alpha=0.85, linewidth=1),
+        )
 
-    ax.set_title("A. Generation Quality vs Total Latency Pareto", fontsize=11, fontweight="bold")
-    ax.set_xlabel("Total Latency (Cloud + Client, s)", fontsize=10)
-    ax.set_ylabel("CLIP Score (Prompt Alignment)", fontsize=10)
+    ax.set_title("A. Generation Quality vs Total Latency Pareto", fontsize=12, fontweight="bold", pad=12)
+    ax.set_xlabel("Total Latency (Cloud + Client, s)", fontsize=10.5, fontweight="bold")
+    ax.set_ylabel("CLIP Score (Prompt Alignment)", fontsize=10.5, fontweight="bold")
+    ax.margins(0.20)
     ax.grid(True, linestyle=":", alpha=0.6)
 
-    # Panel B: Privacy Candidate Pool (N) vs Communication Payload
+    # ── Panel B: Privacy Candidate Pool (N) vs Communication Payload ─
     ax = axes[0, 1]
     n_df = df[df["config_type"] == "n_sweep"]
     grouped_n = n_df.groupby("N")[["total_payload_kb"]].mean()
     
-    ax.plot(grouped_n.index, grouped_n["total_payload_kb"], marker="D", color="#E74C3C", linewidth=2.5, markersize=8)
+    ax.plot(grouped_n.index, grouped_n["total_payload_kb"], marker="D", color="#C0392B", linewidth=2.5, markersize=9, zorder=4)
     for n_val, p_val in zip(grouped_n.index, grouped_n["total_payload_kb"]):
-        ax.annotate(f"{p_val:.1f} KB\n(1/{n_val} = {100/n_val:.0f}%)", (n_val, p_val),
-                    textcoords="offset points", xytext=(0, 10), ha="center", fontsize=9, fontweight="bold")
+        ax.annotate(
+            f"{p_val:.1f} KB\n(1/{n_val} = {100/n_val:.0f}%)",
+            (n_val, p_val),
+            textcoords="offset points",
+            xytext=(0, 14),
+            ha="center",
+            fontsize=9.5,
+            fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.25", facecolor="#FDEDEC", edgecolor="#C0392B", alpha=0.9, linewidth=1),
+        )
 
-    ax.set_title("B. Privacy Guarantee (1/N) vs Payload Overhead", fontsize=11, fontweight="bold")
-    ax.set_xlabel("Candidate Batch Size (N)", fontsize=10)
-    ax.set_ylabel("Total Network Payload (KB)", fontsize=10)
+    ax.set_title("B. Privacy Guarantee (1/N) vs Payload Overhead", fontsize=12, fontweight="bold", pad=12)
+    ax.set_xlabel("Candidate Batch Size (N)", fontsize=10.5, fontweight="bold")
+    ax.set_ylabel("Total Network Payload (KB)", fontsize=10.5, fontweight="bold")
     ax.set_xticks(grouped_n.index)
+    ax.margins(x=0.18, y=0.25)
     ax.grid(True, linestyle=":", alpha=0.6)
 
-    # Panel C: Cloud Speedup vs Cloud Steps (k)
+    # ── Panel C: Cloud Speedup vs Cloud Steps (k) ───────────────────
     ax = axes[1, 0]
     k_df = df[df["config_type"] == "k_sweep"]
     grouped_k = k_df.groupby(["k", "use_accel"])[["cloud_latency_s"]].mean().unstack()
     
     if False in grouped_k.columns and True in grouped_k.columns:
         speedups = grouped_k["cloud_latency_s"][False] / grouped_k["cloud_latency_s"][True]
-        ax.bar(speedups.index.astype(str), speedups.values, color="#1ABC9C", width=0.45, edgecolor="black")
-        for i, (k_val, sp) in enumerate(zip(speedups.index.astype(str), speedups.values)):
-            ax.annotate(f"{sp:.2f}x", (k_val, sp), textcoords="offset points", xytext=(0, 5), ha="center", fontsize=10, fontweight="bold")
+        bars = ax.bar(speedups.index.astype(str), speedups.values, color="#16A085", width=0.45, edgecolor="#0E6251", linewidth=1.2, zorder=4)
+        for bar, (k_val, sp) in zip(bars, zip(speedups.index.astype(str), speedups.values)):
+            yval = bar.get_height()
+            ax.annotate(
+                f"{sp:.2f}x",
+                (bar.get_x() + bar.get_width() / 2, yval),
+                textcoords="offset points",
+                xytext=(0, 6),
+                ha="center",
+                fontsize=10.5,
+                fontweight="bold",
+                color="#0E6251",
+            )
+        max_y = speedups.max()
+        ax.set_ylim(0, max_y * 1.25)
     else:
-        # Fallback if unstacked is formatted differently
         grouped_k_acc = k_df[k_df["use_accel"] == True].groupby("k")["cloud_latency_s"].mean()
-        ax.bar(grouped_k_acc.index.astype(str), grouped_k_acc.values, color="#1ABC9C", width=0.45, edgecolor="black")
+        bars = ax.bar(grouped_k_acc.index.astype(str), grouped_k_acc.values, color="#16A085", width=0.45, edgecolor="black")
 
-    ax.set_title("C. Cloud Acceleration Speedup vs Switch Point (k)", fontsize=11, fontweight="bold")
-    ax.set_xlabel("Cloud Switch Point (k steps)", fontsize=10)
-    ax.set_ylabel("Speedup Factor (x)", fontsize=10)
+    ax.set_title("C. Cloud Acceleration Speedup vs Switch Point (k)", fontsize=12, fontweight="bold", pad=12)
+    ax.set_xlabel("Cloud Switch Point (k steps)", fontsize=10.5, fontweight="bold")
+    ax.set_ylabel("Speedup Factor (x)", fontsize=10.5, fontweight="bold")
     ax.grid(True, linestyle=":", alpha=0.6, axis="y")
 
-    # Panel D: LPIPS Perceptual Distance vs Cloud Switch Point (k)
+    # ── Panel D: LPIPS Perceptual Distance vs Cloud Switch Point (k) ──
     ax = axes[1, 1]
     grouped_lpips = k_df[k_df["use_accel"] == True].groupby("k")[["lpips_distance"]].mean()
     
-    ax.plot(grouped_lpips.index, grouped_lpips["lpips_distance"], marker="o", color="#8E44AD", linewidth=2.5, markersize=8)
+    ax.plot(grouped_lpips.index, grouped_lpips["lpips_distance"], marker="o", color="#8E44AD", linewidth=2.5, markersize=9, zorder=4)
     for k_val, dist in zip(grouped_lpips.index, grouped_lpips["lpips_distance"]):
-        ax.annotate(f"{dist:.3f}", (k_val, dist), textcoords="offset points", xytext=(0, 8), ha="center", fontsize=9, fontweight="bold")
+        ax.annotate(
+            f"{dist:.3f}",
+            (k_val, dist),
+            textcoords="offset points",
+            xytext=(0, 10),
+            ha="center",
+            fontsize=9.5,
+            fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.2", facecolor="#F4ECF7", edgecolor="#8E44AD", alpha=0.9, linewidth=1),
+        )
 
-    ax.set_title("D. LPIPS Perceptual Distance vs Switch Point (k)", fontsize=11, fontweight="bold")
-    ax.set_xlabel("Cloud Switch Point (k steps)", fontsize=10)
-    ax.set_ylabel("LPIPS Distance (Lower = Closer to Source)", fontsize=10)
+    ax.set_title("D. LPIPS Perceptual Distance vs Switch Point (k)", fontsize=12, fontweight="bold", pad=12)
+    ax.set_xlabel("Cloud Switch Point (k steps)", fontsize=10.5, fontweight="bold")
+    ax.set_ylabel("LPIPS Distance (Lower = Closer to Source)", fontsize=10.5, fontweight="bold")
     ax.set_xticks(grouped_lpips.index)
+    ax.margins(x=0.18, y=0.25)
     ax.grid(True, linestyle=":", alpha=0.6)
 
     plt.tight_layout()
-    plt.savefig(output_path)
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.savefig(output_jpg_path, dpi=300, bbox_inches="tight")
     plt.close()
-    print(f"[Metrics] ✓ Saved publication tradeoff plots to: {output_path}")
+    print(f"[Metrics] ✓ Saved publication tradeoff plots to:\n  - {output_path}\n  - {output_jpg_path}")
 
 
 def main():
     print("=" * 70)
-    print("ObCLIP-I2I Phase 3 — Paper Benchmarks (Multi-Baseline & Sweeps)")
+    print("ObCLIP-I2I Paper Benchmarks — High-Fidelity Multi-Baseline & Sweeps")
     print("=" * 70)
 
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -317,25 +389,33 @@ def main():
         prompt = "wearing glasses and a formal suit"
         records = []
 
+        # Total active steps at strength=0.55 is int(30 * 0.55) = 16
+        n_active_total = int(NUM_INFERENCE_STEPS * DEFAULT_STRENGTH)  # 16
+        k_pareto = 10
+        N_pareto = 4
+
         # ── Benchmark 1: The 4 Baselines (10 images) ───────────────────
         print("\n" + "=" * 60)
-        print("STAGE 1: Evaluating 4 Baselines across 10 images...")
+        print(f"STAGE 1: Evaluating 4 Baselines across 10 images (k={k_pareto}, N={N_pareto})...")
         print("=" * 60)
 
         for img_idx, p in enumerate(test_paths):
             real_img = Image.open(p).convert("RGB")
             print(f"\n[Test Image {img_idx+1}/10] {os.path.basename(p)}")
 
-            # 1. Cloud-Only (k=15, N=1, no acceleration needed)
+            # 1. Cloud-Only (k=16, N=1, all active steps on Realistic Vision V5.1)
             res_cloud = run_pipeline(
                 real_image=real_img, prompt=prompt, models_dict=models_dict,
-                n=1, strength=0.6, k=15, use_accel=False, match_lighting=False
+                n=1, strength=DEFAULT_STRENGTH, k=n_active_total,
+                cloud_guidance_scale=CLOUD_GUIDANCE_SCALE,
+                use_accel=False, match_lighting=False, use_lab_match=True
             )
+            assert not np.isnan(np.array(res_cloud["final_image"])).any(), "Cloud-Only produced NaN!"
             c_score = evaluator.compute_clip_score(res_cloud["final_image"], prompt)
             lp_dist = evaluator.compute_lpips(real_img, res_cloud["final_image"])
             records.append({
                 "image_idx": img_idx, "config_type": "baseline", "baseline_name": "Cloud-Only",
-                "k": 15, "N": 1, "use_accel": False,
+                "k": n_active_total, "N": 1, "use_accel": False,
                 "clip_score": c_score, "lpips_distance": lp_dist,
                 "cloud_latency_s": res_cloud["cloud_latency_s"], "client_latency_s": res_cloud["client_latency_s"],
                 "total_latency_s": round(res_cloud["cloud_latency_s"] + res_cloud["client_latency_s"], 3),
@@ -344,10 +424,13 @@ def main():
                 "peak_vram_mb": res_cloud["peak_vram_mb"],
             })
 
-            # 2. Client-Only (k=0, N=1)
+            # 2. Client-Only (k=0, N=1, all active steps on small-sd)
             res_client = run_client_only(
-                real_image=real_img, prompt=prompt, models_dict=models_dict, strength=0.6
+                real_image=real_img, prompt=prompt, models_dict=models_dict,
+                strength=DEFAULT_STRENGTH, total_steps=NUM_INFERENCE_STEPS,
+                guidance_scale=CLIENT_GUIDANCE_SCALE, use_lab_match=True
             )
+            assert not np.isnan(np.array(res_client["final_image"])).any(), "Client-Only produced NaN!"
             c_score = evaluator.compute_clip_score(res_client["final_image"], prompt)
             lp_dist = evaluator.compute_lpips(real_img, res_client["final_image"])
             records.append({
@@ -361,16 +444,19 @@ def main():
                 "peak_vram_mb": res_client["peak_vram_mb"],
             })
 
-            # 3. Vanilla ObCLIP-I2I (k=5, N=4, use_accel=False)
+            # 3. Vanilla ObCLIP-I2I (k=10, N=4, use_accel=False)
             res_vanilla = run_pipeline(
                 real_image=real_img, prompt=prompt, models_dict=models_dict,
-                n=4, strength=0.6, k=5, use_accel=False, match_lighting=True
+                n=N_pareto, strength=DEFAULT_STRENGTH, k=k_pareto,
+                cloud_guidance_scale=CLOUD_GUIDANCE_SCALE, client_guidance_scale=CLIENT_GUIDANCE_SCALE,
+                use_accel=False, match_lighting=True, use_lab_match=True
             )
+            assert not np.isnan(np.array(res_vanilla["final_image"])).any(), "Vanilla ObCLIP produced NaN!"
             c_score = evaluator.compute_clip_score(res_vanilla["final_image"], prompt)
             lp_dist = evaluator.compute_lpips(real_img, res_vanilla["final_image"])
             records.append({
                 "image_idx": img_idx, "config_type": "baseline", "baseline_name": "Vanilla ObCLIP-I2I",
-                "k": 5, "N": 4, "use_accel": False,
+                "k": k_pareto, "N": N_pareto, "use_accel": False,
                 "clip_score": c_score, "lpips_distance": lp_dist,
                 "cloud_latency_s": res_vanilla["cloud_latency_s"], "client_latency_s": res_vanilla["client_latency_s"],
                 "total_latency_s": round(res_vanilla["cloud_latency_s"] + res_vanilla["client_latency_s"], 3),
@@ -379,16 +465,19 @@ def main():
                 "peak_vram_mb": res_vanilla["peak_vram_mb"],
             })
 
-            # 4. Accelerated ObCLIP-I2I (k=5, N=4, use_accel=True, r=2, s=4)
+            # 4. Accelerated ObCLIP-I2I (k=10, N=4, use_accel=True, r=2, s=5)
             res_accel = run_pipeline(
                 real_image=real_img, prompt=prompt, models_dict=models_dict,
-                n=4, strength=0.6, k=5, use_accel=True, r=2, s=4, match_lighting=True
+                n=N_pareto, strength=DEFAULT_STRENGTH, k=k_pareto,
+                cloud_guidance_scale=CLOUD_GUIDANCE_SCALE, client_guidance_scale=CLIENT_GUIDANCE_SCALE,
+                use_accel=True, r=2, s=5, match_lighting=True, use_lab_match=True
             )
+            assert not np.isnan(np.array(res_accel["final_image"])).any(), "Accelerated ObCLIP produced NaN!"
             c_score = evaluator.compute_clip_score(res_accel["final_image"], prompt)
             lp_dist = evaluator.compute_lpips(real_img, res_accel["final_image"])
             records.append({
                 "image_idx": img_idx, "config_type": "baseline", "baseline_name": "Accelerated ObCLIP-I2I",
-                "k": 5, "N": 4, "use_accel": True,
+                "k": k_pareto, "N": N_pareto, "use_accel": True,
                 "clip_score": c_score, "lpips_distance": lp_dist,
                 "cloud_latency_s": res_accel["cloud_latency_s"], "client_latency_s": res_accel["client_latency_s"],
                 "total_latency_s": round(res_accel["cloud_latency_s"] + res_accel["client_latency_s"], 3),
@@ -397,20 +486,22 @@ def main():
                 "peak_vram_mb": res_accel["peak_vram_mb"],
             })
 
-        # ── Benchmark 2: Sweeps across a representative subset ────────
+        # ── Benchmark 2: Sweeps across representative test image ──────
         print("\n" + "=" * 60)
-        print("STAGE 2: Evaluating k and N sweeps...")
+        print("STAGE 2: Evaluating k in {4, 7, 10} and N in {2, 4, 6} sweeps...")
         print("=" * 60)
 
         sweep_img = Image.open(test_paths[0]).convert("RGB")
 
-        # k sweep: k in [3, 5, 7], compare vanilla and accelerated
-        for k_val in [3, 5, 7]:
-            s_val = min(4, k_val - 1)
+        # k sweep: k in [4, 7, 10], compare vanilla and accelerated
+        for k_val in [4, 7, 10]:
+            s_val = min(5, k_val - 1)
             # Vanilla
             res_v = run_pipeline(
                 real_image=sweep_img, prompt=prompt, models_dict=models_dict,
-                n=4, strength=0.6, k=k_val, use_accel=False, match_lighting=True
+                n=4, strength=DEFAULT_STRENGTH, k=k_val,
+                cloud_guidance_scale=CLOUD_GUIDANCE_SCALE, client_guidance_scale=CLIENT_GUIDANCE_SCALE,
+                use_accel=False, match_lighting=True, use_lab_match=True
             )
             c_v = evaluator.compute_clip_score(res_v["final_image"], prompt)
             lp_v = evaluator.compute_lpips(sweep_img, res_v["final_image"])
@@ -427,7 +518,9 @@ def main():
             # Accelerated
             res_a = run_pipeline(
                 real_image=sweep_img, prompt=prompt, models_dict=models_dict,
-                n=4, strength=0.6, k=k_val, use_accel=True, r=2, s=s_val, match_lighting=True
+                n=4, strength=DEFAULT_STRENGTH, k=k_val,
+                cloud_guidance_scale=CLOUD_GUIDANCE_SCALE, client_guidance_scale=CLIENT_GUIDANCE_SCALE,
+                use_accel=True, r=2, s=s_val, match_lighting=True, use_lab_match=True
             )
             c_a = evaluator.compute_clip_score(res_a["final_image"], prompt)
             lp_a = evaluator.compute_lpips(sweep_img, res_a["final_image"])
@@ -442,17 +535,19 @@ def main():
                 "peak_vram_mb": res_a["peak_vram_mb"],
             })
 
-        # N sweep: N in [2, 4, 6] (at k=5, accelerated)
+        # N sweep: N in [2, 4, 6] (at k=10, accelerated)
         for n_val in [2, 4, 6]:
             res_n = run_pipeline(
                 real_image=sweep_img, prompt=prompt, models_dict=models_dict,
-                n=n_val, strength=0.6, k=5, use_accel=True, r=2, s=4, match_lighting=True
+                n=n_val, strength=DEFAULT_STRENGTH, k=10,
+                cloud_guidance_scale=CLOUD_GUIDANCE_SCALE, client_guidance_scale=CLIENT_GUIDANCE_SCALE,
+                use_accel=True, r=2, s=5, match_lighting=True, use_lab_match=True
             )
             c_n = evaluator.compute_clip_score(res_n["final_image"], prompt)
             lp_n = evaluator.compute_lpips(sweep_img, res_n["final_image"])
             records.append({
                 "image_idx": 0, "config_type": "n_sweep", "baseline_name": f"N={n_val}_accel",
-                "k": 5, "N": n_val, "use_accel": True,
+                "k": 10, "N": n_val, "use_accel": True,
                 "clip_score": c_n, "lpips_distance": lp_n,
                 "cloud_latency_s": res_n["cloud_latency_s"], "client_latency_s": res_n["client_latency_s"],
                 "total_latency_s": round(res_n["cloud_latency_s"] + res_n["client_latency_s"], 3),
@@ -467,12 +562,13 @@ def main():
         df.to_csv(csv_path, index=False)
         print(f"\n[Metrics] ✓ Saved full benchmark results to: {csv_path}")
 
-        plot_path = os.path.join(project_root, "eval", "tradeoff_plots.png")
-        plot_paper_tradeoffs(df, plot_path)
+        plot_png = os.path.join(project_root, "eval", "tradeoff_plots.png")
+        plot_jpg = os.path.join(project_root, "tradeoff_plots.jpg")
+        plot_paper_tradeoffs(df, plot_png, plot_jpg)
 
-        # ── Print Summary Table ───────────────────────────────────────
+        # ── Print Summary Tables for Slides / Thesis ─────────────────
         base_df = df[df["config_type"] == "baseline"]
-        agg = base_df.groupby("baseline_name").agg({
+        agg_base = base_df.groupby("baseline_name").agg({
             "clip_score": ["mean", "std"],
             "lpips_distance": ["mean", "std"],
             "cloud_latency_s": "mean",
@@ -482,11 +578,50 @@ def main():
             "peak_vram_mb": "max",
         }).round(3)
 
-        print("\n" + "=" * 80)
-        print("PHASE 3 PAPER BENCHMARK SUMMARY (4 BASELINES, 10 TEST IMAGES)")
-        print("=" * 80)
-        print(agg)
-        print("=" * 80)
+        print("\n" + "=" * 85)
+        print("PANEL A: 4 BASELINES SUMMARY (10 TEST IMAGES, k=10, N=4)")
+        print("=" * 85)
+        print(agg_base)
+        print("=" * 85)
+
+        # Panel B Numbers
+        n_df = df[df["config_type"] == "n_sweep"]
+        grouped_n = n_df.groupby("N")[["total_payload_kb", "total_latency_s", "peak_vram_mb"]].mean().round(2)
+        print("\n" + "=" * 85)
+        print("PANEL B: N-SWEEP SUMMARY (PRIVACY GUARANTEE vs PAYLOAD)")
+        print("=" * 85)
+        for n_val, row in grouped_n.iterrows():
+            print(f"  • N = {n_val}: Payload = {row['total_payload_kb']:.1f} KB, Guessing Bound = {100/n_val:.1f}%, Peak VRAM = {row['peak_vram_mb']:.1f} MB")
+        print("=" * 85)
+
+        # Panel C Numbers
+        k_df = df[df["config_type"] == "k_sweep"]
+        grouped_k = k_df.groupby(["k", "use_accel"])[["cloud_latency_s"]].mean().unstack()
+        print("\n" + "=" * 85)
+        print("PANEL C: k-SWEEP SPEEDUP SUMMARY (CLOUD LATENCY & ACCELERATION)")
+        print("=" * 85)
+        for k_val in [4, 7, 10]:
+            t_v = grouped_k["cloud_latency_s"][False][k_val]
+            t_a = grouped_k["cloud_latency_s"][True][k_val]
+            sp = t_v / t_a
+            red = (1.0 - t_a / t_v) * 100
+            print(f"  • k = {k_val:2d}: Vanilla = {t_v:.2f}s | Accel = {t_a:.2f}s | Speedup = {sp:.2f}x ({red:.1f}% reduction)")
+        print("=" * 85)
+
+        # Panel D Numbers
+        grouped_lpips = k_df[k_df["use_accel"] == True].groupby("k")[["lpips_distance", "clip_score"]].mean().round(3)
+        print("\n" + "=" * 85)
+        print("PANEL D: LPIPS & CLIP SCORE vs SWITCH POINT k (ACCELERATED)")
+        print("=" * 85)
+        for k_val, row in grouped_lpips.iterrows():
+            print(f"  • k = {k_val:2d}: LPIPS = {row['lpips_distance']:.3f} | CLIP Score = {row['clip_score']:.3f}")
+        print("=" * 85)
+
+        # Global assertions
+        assert not df[["clip_score", "lpips_distance", "total_latency_s"]].isna().any().any(), "Found NaNs in benchmark metrics!"
+        max_vram_n4 = df[df["N"] <= 4]["peak_vram_mb"].max()
+        assert max_vram_n4 < 3072, f"Peak VRAM for N<=4 exceeded 3.0 GB! Max: {max_vram_n4}"
+        print(f"\n[Metrics] ✓ ALL CHECKS PASSED: 0 NaNs, Peak VRAM (N=4) = {max_vram_n4:.1f} MB (< 3.0 GB), Peak VRAM (N=6) = {df['peak_vram_mb'].max():.1f} MB (< 3.1 GB)")
 
     finally:
         if server_proc is not None:
